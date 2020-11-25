@@ -128,17 +128,17 @@ def create_kitti_info_file(data_path,
     print(f'Kitti info trainval file is saved to {filename}')
     mmcv.dump(kitti_infos_train + kitti_infos_val, filename)
 
-    kitti_infos_test = get_kitti_image_info(
-        data_path,
-        training=False,
-        label_info=False,
-        velodyne=True,
-        calib=True,
-        image_ids=test_img_ids,
-        relative_path=relative_path)
-    filename = save_path / f'{pkl_prefix}_infos_test.pkl'
-    print(f'Kitti info test file is saved to {filename}')
-    mmcv.dump(kitti_infos_test, filename)
+    # kitti_infos_test = get_kitti_image_info(
+    #     data_path,
+    #     training=False,
+    #     label_info=False,
+    #     velodyne=True,
+    #     calib=True,
+    #     image_ids=test_img_ids,
+    #     relative_path=relative_path)
+    # filename = save_path / f'{pkl_prefix}_infos_test.pkl'
+    # print(f'Kitti info test file is saved to {filename}')
+    # mmcv.dump(kitti_infos_test, filename)
 
 
 def create_waymo_info_file(data_path,
