@@ -144,10 +144,14 @@ class PillarFeatureNet(nn.Module):
         mask = torch.unsqueeze(mask, -1).type_as(features)
         features *= mask
 
+        #获得反射率
+        reflection = features[:, :, 3].clone()
+        reflection_max = torch.max(reflection, dim=1, keepdim=True)[0]
+
         for pfn in self.pfn_layers:
             features = pfn(features, num_points)
 
-        return features.squeeze()
+        return features.squeeze(), reflection_max
 
 
 @VOXEL_ENCODERS.register_module()

@@ -69,6 +69,7 @@ class PointPillarsScatter(nn.Module):
         """
         # batch_canvas will be the final output.
         batch_canvas = []
+        self.in_channels = voxel_features.shape[1]
         for batch_itt in range(batch_size):
             # Create the canvas for this sample
             canvas = torch.zeros(

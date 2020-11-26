@@ -37,17 +37,36 @@ class VoxelNet(SingleStage3DDetector):
         self.voxel_encoder = builder.build_voxel_encoder(voxel_encoder)
         self.middle_encoder = builder.build_middle_encoder(middle_encoder)
         self.img_encoder = ImgFeatExtractor()
+        self.refmap_encoder = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1, stride=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU()
+        )
+        self.ref_to_cls = nn.Sequential(
+            nn.Conv2d(64, 18, kernel_size=1),
+            nn.BatchNorm2d(18),
+            nn.ReLU()
+        )
 
     def extract_feat(self, points, img_metas):
         """Extract features from points."""
         voxels, num_points, coors = self.voxelize(points)
-        voxel_features = self.voxel_encoder(voxels, num_points, coors)
+        #提取出反射率信息
+        voxel_features, reflection = self.voxel_encoder(voxels, num_points, coors)
         batch_size = coors[-1, 0].item() + 1
+
+        #对反射率地图做scatter
+        ref_map = self.middle_encoder(reflection, coors, batch_size)
+        ref_map = self.refmap_encoder(ref_map)
+
         x = self.middle_encoder(voxel_features, coors, batch_size)
         x = self.backbone(x)
         if self.with_neck:
             x = self.neck(x)
-        return x
+        return x, ref_map
 
     @torch.no_grad()
     @force_fp32()
@@ -90,16 +109,20 @@ class VoxelNet(SingleStage3DDetector):
         Returns:
             dict: Losses of each branch.
         """
-        x = self.extract_feat(points, img_metas)
+        x, ref_map = self.extract_feat(points, img_metas)
         #img特征提取
         img_feat = self.img_encoder(img)
         img_feat = self.bbox_head([img_feat])
 
         outs = self.bbox_head(x)
+        #从反射率地图中求cls score
+        ref_cls_score = self.ref_to_cls(ref_map)
 
         #用img求结果与point结果相加
         for i in range(len(outs)):
             outs[i][0] += img_feat[i][0]
+        #用反射率加权
+        outs[0][0] *= (ref_cls_score * 2 + 1)
 
         loss_inputs = outs + (gt_bboxes_3d, gt_labels_3d, img_metas)
         losses = self.bbox_head.loss(
@@ -108,14 +131,19 @@ class VoxelNet(SingleStage3DDetector):
 
     def simple_test(self, points, img_metas, imgs=None, rescale=False):
         """Test function without augmentaiton."""
-        x = self.extract_feat(points, img_metas)
+        x, ref_map = self.extract_feat(points, img_metas)
 
         img_feat = self.img_encoder(imgs)
         img_feat = self.bbox_head([img_feat])
 
         outs = self.bbox_head(x)
+        #从反射率地图中求cls score
+        ref_cls_score = self.ref_to_cls(ref_map)
+
         for i in range(len(outs)):
             outs[i][0] += img_feat[i][0]
+        #用反射率加权
+        outs[0][0] *= (ref_cls_score * 2 + 1)
 
         bbox_list = self.bbox_head.get_bboxes(
             *outs, img_metas, rescale=rescale)
