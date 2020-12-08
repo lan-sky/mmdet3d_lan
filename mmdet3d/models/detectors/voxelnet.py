@@ -9,6 +9,7 @@ from .. import builder
 from .single_stage import SingleStage3DDetector
 import torch.nn as nn
 import torchvision
+import numpy as np
 
 
 @DETECTORS.register_module()
@@ -36,20 +37,38 @@ class VoxelNet(SingleStage3DDetector):
         self.voxel_layer = Voxelization(**voxel_layer)
         self.voxel_encoder = builder.build_voxel_encoder(voxel_encoder)
         self.middle_encoder = builder.build_middle_encoder(middle_encoder)
-        self.img_encoder = ImgFeatExtractor()
-        self.refmap_encoder = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(64),
-            nn.ReLU()
-        )
-        self.ref_to_cls = nn.Sequential(
-            nn.Conv2d(64, 18, kernel_size=1),
-            nn.BatchNorm2d(18),
-            nn.ReLU()
-        )
+        # 融合Img信息部分代码
+        # self.img_encoder = ImgFeatExtractor()
+        # self.refmap_encoder = nn.Sequential(
+        #     nn.Conv2d(1, 64, kernel_size=3, padding=1, stride=1),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(),
+        #     nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU()
+        # )
+        # self.ref_to_cls = nn.Sequential(
+        #     nn.Conv2d(64, 18, kernel_size=1),
+        #     nn.BatchNorm2d(18),
+        #     nn.ReLU()
+        # )
+
+        # 转换RangeImage部分相关代码
+        self.H = 48
+        self.W = 512
+        self.fov_up = 3
+        self.fov_down = -15.0
+        self.pi = torch.tensor(np.pi)
+        fov_up = self.fov_up * self.pi / 180.0
+        fov_down = self.fov_down * self.pi / 180.0
+        fov = abs(fov_up) + abs(fov_down)
+        self.uv = torch.zeros((2, self.H, self.W))
+        self.uv[1] = torch.arange(0, self.W)
+        self.uv.permute((0, 2, 1))[0] = torch.arange(0, self.H)
+        self.uv[0] = ((self.H - self.uv[0]) * fov - abs(fov_down) * self.H) / self.H
+        self.uv[1] = (self.uv[1] * 2.0 - self.W) * self.pi / (self.W * 4)  # 最后一个 4 用来控制水平范围
+
+        self.range_encoder = RangeEncoder(5, 64, use_img=True)
 
     def extract_feat(self, points, img_metas):
         """Extract features from points."""
@@ -59,14 +78,14 @@ class VoxelNet(SingleStage3DDetector):
         batch_size = coors[-1, 0].item() + 1
 
         #对反射率地图做scatter
-        ref_map = self.middle_encoder(reflection, coors, batch_size)
-        ref_map = self.refmap_encoder(ref_map)
+        # ref_map = self.middle_encoder(reflection, coors, batch_size)
+        # ref_map = self.refmap_encoder(ref_map)
 
         x = self.middle_encoder(voxel_features, coors, batch_size)
         x = self.backbone(x)
         if self.with_neck:
             x = self.neck(x)
-        return x, ref_map
+        return x
 
     @torch.no_grad()
     @force_fp32()
@@ -109,20 +128,34 @@ class VoxelNet(SingleStage3DDetector):
         Returns:
             dict: Losses of each branch.
         """
-        x, ref_map = self.extract_feat(points, img_metas)
+
+        # 转换成range提取特征后转回lidar
+        batchsize = len(points)
+        rangeImage = []
+        for i in range(batchsize):
+            rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
+        rangeImage = torch.cat(rangeImage, dim=0)
+        # 是否加入img信息
+        range_feat = self.range_encoder(rangeImage, img)
+        range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
+        pts_with_range = []
+        for i in range(batchsize):
+            pts_with_range.append(self.range_to_lidar_gpu(range_ori[i].squeeze(0)))
+
+        x = self.extract_feat(pts_with_range, img_metas)
         #img特征提取
-        img_feat = self.img_encoder(img)
-        img_feat = self.bbox_head([img_feat])
+        # img_feat = self.img_encoder(img)
+        # img_feat = self.bbox_head([img_feat])
 
         outs = self.bbox_head(x)
         #从反射率地图中求cls score
-        ref_cls_score = self.ref_to_cls(ref_map)
+        # ref_cls_score = self.ref_to_cls(ref_map)
 
         #用img求结果与point结果相加
-        for i in range(len(outs)):
-            outs[i][0] += img_feat[i][0]
+        # for i in range(len(outs)):
+        #     outs[i][0] += img_feat[i][0]
         #用反射率加权
-        outs[0][0] *= (ref_cls_score * 2 + 1)
+        # outs[0][0] *= (ref_cls_score * 2 + 1)
 
         loss_inputs = outs + (gt_bboxes_3d, gt_labels_3d, img_metas)
         losses = self.bbox_head.loss(
@@ -131,19 +164,34 @@ class VoxelNet(SingleStage3DDetector):
 
     def simple_test(self, points, img_metas, imgs=None, rescale=False):
         """Test function without augmentaiton."""
-        x, ref_map = self.extract_feat(points, img_metas)
 
-        img_feat = self.img_encoder(imgs)
-        img_feat = self.bbox_head([img_feat])
+        # 转换成range提取特征后转回lidar
+        batchsize = len(points)
+        rangeImage = []
+        for i in range(batchsize):
+            rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
+        rangeImage = torch.cat(rangeImage, dim=0)
+        # 是否加入img信息
+        range_feat = self.range_encoder(rangeImage, imgs)
+        range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
+        pts_with_range = []
+        for i in range(batchsize):
+            pts_with_range.append(self.range_to_lidar_gpu(range_ori[i].squeeze(0)))
+
+        x = self.extract_feat(pts_with_range, img_metas)
+
+        # img特征提取
+        # img_feat = self.img_encoder(imgs)
+        # img_feat = self.bbox_head([img_feat])
 
         outs = self.bbox_head(x)
         #从反射率地图中求cls score
-        ref_cls_score = self.ref_to_cls(ref_map)
+        # ref_cls_score = self.ref_to_cls(ref_map)
 
-        for i in range(len(outs)):
-            outs[i][0] += img_feat[i][0]
+        # for i in range(len(outs)):
+        #     outs[i][0] += img_feat[i][0]
         #用反射率加权
-        outs[0][0] *= (ref_cls_score * 2 + 1)
+        # outs[0][0] *= (ref_cls_score * 2 + 1)
 
         bbox_list = self.bbox_head.get_bboxes(
             *outs, img_metas, rescale=rescale)
@@ -174,6 +222,57 @@ class VoxelNet(SingleStage3DDetector):
                                             self.bbox_head.test_cfg)
 
         return [merged_bboxes]
+
+    def lidar_to_range_gpu(self, points):
+        device = points.device
+        pi = torch.tensor(np.pi).to(device)
+        fov_up = self.fov_up * pi / 180.0
+        fov_down = self.fov_down * pi / 180.0
+        fov = abs(fov_up) + abs(fov_down)
+
+        depth = torch.norm(points, 2, dim=1)
+
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+
+        yaw = torch.atan2(y, x)
+        pitch = torch.asin(z / depth)
+
+        u = 0.5 * (1 - 4 * yaw / pi) * self.W  # 最后一个 4 用来控制水平范围
+        v = (1 - (pitch + abs(fov_down)) / fov) * self.H
+
+        zero_tensor = torch.zeros_like(u)
+        W_tensor = torch.ones_like(u) * (self.W - 1)
+        H_tensor = torch.ones_like(v) * (self.H - 1)
+
+        u = torch.floor(u)
+        u = torch.min(u, W_tensor)
+        u = torch.max(u, zero_tensor).long()
+
+        v = torch.floor(v)
+        v = torch.min(v, H_tensor)
+        v = torch.max(v, zero_tensor).long()
+
+        range_image = torch.full((5, self.H, self.W), 0, dtype=torch.float32).to(device)
+        range_image[0][v, u] = depth
+        range_image[1][v, u] = points[:, 3]
+        range_image[2][v, u] = points[:, 0]
+        range_image[3][v, u] = points[:, 1]
+        range_image[4][v, u] = points[:, 2]
+        return range_image
+
+    def range_to_lidar_gpu(self, range_img):
+        device = range_img.device
+        self.uv = self.uv.to(device)
+        lidar_out = torch.zeros((8, self.H, self.W)).to(device)
+        lidar_out[0] = range_img[0] * torch.cos(self.uv[0]) * torch.cos(self.uv[1])
+        lidar_out[1] = range_img[0] * torch.cos(self.uv[0]) * torch.sin(self.uv[1]) * (-1)
+        lidar_out[2] = range_img[0] * torch.sin(self.uv[0])
+        lidar_out[3:] = range_img[1:]
+        lidar_out = lidar_out.permute((2, 1, 0)).reshape([-1, 8])
+        lidar_out = lidar_out[torch.where(lidar_out[:, 0] != 0)]
+        return lidar_out
 
 class ImgFeatExtractor(nn.Module):
     def __init__(self):
@@ -219,3 +318,174 @@ class ImgFeatExtractor(nn.Module):
         out3 = self.deblocks[2](out3)
         img_feat = torch.cat((out1, out2, out3), dim=1)
         return img_feat
+
+class RangeEncoder(nn.Module):
+    def __init__(self, in_channel, out_channel, use_img=False):
+        super(RangeEncoder, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channel, 32, kernel_size=3, padding=1, stride=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 256)
+        self.down4 = Down(256, 256)
+
+        self.up1 = Up(256, 256, 128)
+        self.up2 = Up(128, 256, 128)
+        self.up3 = Up(128, 128, 64)
+        self.up4 = Up(64, 64, out_channel)
+        if use_img:
+            self.img_conv = nn.Sequential(
+                nn.Conv2d(3, 32, kernel_size=3, padding=1, stride=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True)
+            )
+            self.img_down1 = Down(64, 128)
+            self.img_down2 = Down(128, 256)
+            self.img_down3 = Down(256, 256)
+            self.img_down4 = Down(256, 256)
+            self.img_lidar_conv1 = nn.Sequential(
+                nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, padding=1, stride=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True)
+            )
+            self.img_lidar_conv2 = nn.Sequential(
+                nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, padding=1, stride=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True)
+            )
+            self.img_lidar_conv3 = nn.Sequential(
+                nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, padding=1, stride=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True)
+            )
+            self.img_lidar_conv4 = nn.Sequential(
+                nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, padding=1, stride=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True)
+            )
+        self.down_sample = nn.Sequential(
+            nn.Conv2d(in_channels=64, out_channels=4, kernel_size=1, padding=0, stride=1),
+            nn.BatchNorm2d(4),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x, img=None):
+        x = self.conv(x)
+
+        if img is not None:
+            img = img[:, :, (img.shape[2]) // 3:, :]
+            img = F.interpolate(img, (48, 512))
+            img = self.img_conv(img)
+
+            img1 = self.img_down1(img)
+            x_d1 = self.down1(x)
+            x_d1 = torch.cat((x_d1, img1), dim=1)
+            x_d1 = self.img_lidar_conv1(x_d1)
+
+            img2 = self.img_down2(img1)
+            x_d2 = self.down2(x_d1)
+            x_d2 = torch.cat((x_d2, img2), dim=1)
+            x_d2 = self.img_lidar_conv2(x_d2)
+
+            img3 = self.img_down3(img2)
+            x_d3 = self.down3(x_d2)
+            x_d3 = torch.cat((x_d3, img3), dim=1)
+            x_d3 = self.img_lidar_conv3(x_d3)
+
+            img4 = self.img_down4(img3)
+            x_d4 = self.down4(x_d3)
+            x_d4 = torch.cat((x_d4, img4), dim=1)
+            x_d4 = self.img_lidar_conv4(x_d4)
+
+        else:
+            x_d1 = self.down1(x)
+            x_d2 = self.down2(x_d1)
+            x_d3 = self.down3(x_d2)
+            x_d4 = self.down4(x_d3)
+
+        x_u1 = self.up1(x_d4, x_d3)
+        x_u2 = self.up2(x_u1, x_d2)
+        x_u3 = self.up3(x_u2, x_d1)
+        x_u4 = self.up4(x_u3, x)
+
+        x_out = self.down_sample(x_u4)
+        return x_out
+
+
+class Down(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(Down, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=(3, 3), padding=1, stride=1),
+            nn.BatchNorm2d(in_channel),
+            nn.ReLU(inplace=True)
+        )
+        self.dilatedconv1 = nn.Sequential(
+            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=(3, 3), padding=2, stride=1, dilation=2),
+            nn.BatchNorm2d(in_channel),
+            nn.ReLU(inplace=True)
+        )
+        self.dilatedconv2 = nn.Sequential(
+            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=(3, 3), padding=2, stride=1, dilation=2),
+            nn.BatchNorm2d(in_channel),
+            nn.ReLU(inplace=True)
+        )
+        self.dilatedconv3 = nn.Sequential(
+            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=(3, 3), padding=2, stride=1, dilation=2),
+            nn.BatchNorm2d(in_channel),
+            nn.ReLU(inplace=True)
+        )
+        self.down = nn.Sequential(
+            nn.Conv2d(in_channels=in_channel * 3, out_channels=out_channel, kernel_size=(3, 3), padding=1, stride=1),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU(),
+            nn.Dropout2d(0.25),
+            nn.MaxPool2d((2, 2))
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x1 = self.dilatedconv1(x)
+        x2 = self.dilatedconv2(x1)
+        x3 = self.dilatedconv3(x2)
+        x_all = torch.cat((x1, x2, x3), dim=1)
+        x_out = self.down(x_all)
+        return x_out
+
+class Up(nn.Module):
+    def __init__(self, in_channel, res_channel, out_channel):
+        super(Up, self).__init__()
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(in_channels=in_channel, out_channels=out_channel, kernel_size=(3, 3), stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU(inplace=True)
+        )
+        mid_channels = (out_channel + res_channel) // 2
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels=(out_channel + res_channel), out_channels=mid_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=mid_channels, out_channels=out_channel, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        x = torch.cat((x1, x2), dim=1)
+        x = self.conv(x)
+        x = nn.Dropout2d(0.25)(x)
+        return x
+
+class Transformer(nn.Module):
+    def __init__(self):
+        super(Transformer, self).__init__()

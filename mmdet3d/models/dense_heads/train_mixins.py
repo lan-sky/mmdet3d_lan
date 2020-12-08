@@ -270,9 +270,9 @@ class AnchorTrainMixin(object):
             if not isinstance(gt_bboxes, torch.Tensor):
                 gt_bboxes = gt_bboxes.tensor.to(anchors.device)
             assign_result = bbox_assigner.assign(anchors, gt_bboxes,
-                                                 gt_bboxes_ignore, gt_labels)
+                                                 gt_bboxes_ignore, gt_labels)       #确定与每一个gt相关性最高的bbox
             sampling_result = self.bbox_sampler.sample(assign_result, anchors,
-                                                       gt_bboxes)
+                                                       gt_bboxes)                   #确定正样本和负样本
             pos_inds = sampling_result.pos_inds
             neg_inds = sampling_result.neg_inds
         else:
