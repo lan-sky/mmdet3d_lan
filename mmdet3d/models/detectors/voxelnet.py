@@ -68,7 +68,8 @@ class VoxelNet(SingleStage3DDetector):
         self.uv[0] = ((self.H - self.uv[0]) * fov - abs(fov_down) * self.H) / self.H
         self.uv[1] = (self.uv[1] * 2.0 - self.W) * self.pi / (self.W * 4)  # 最后一个 4 用来控制水平范围
 
-        self.range_encoder = RangeEncoder(5, 64, use_img=True)
+        # self.range_encoder = RangeEncoder(5, 64, use_img=True)
+        self.fusion = Fusion(5, 3)
 
     def extract_feat(self, points, img_metas):
         """Extract features from points."""
@@ -136,7 +137,8 @@ class VoxelNet(SingleStage3DDetector):
             rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
         rangeImage = torch.cat(rangeImage, dim=0)
         # 是否加入img信息
-        range_feat = self.range_encoder(rangeImage, img)
+        # range_feat = self.range_encoder(rangeImage, img)      #用自编码器的形式
+        range_feat = self.fusion(rangeImage, img)
         range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
         pts_with_range = []
         for i in range(batchsize):
@@ -172,7 +174,8 @@ class VoxelNet(SingleStage3DDetector):
             rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
         rangeImage = torch.cat(rangeImage, dim=0)
         # 是否加入img信息
-        range_feat = self.range_encoder(rangeImage, imgs)
+        # range_feat = self.range_encoder(rangeImage, imgs)      #用自编码器的形式
+        range_feat = self.fusion(rangeImage, imgs)
         range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
         pts_with_range = []
         for i in range(batchsize):
@@ -265,12 +268,12 @@ class VoxelNet(SingleStage3DDetector):
     def range_to_lidar_gpu(self, range_img):
         device = range_img.device
         self.uv = self.uv.to(device)
-        lidar_out = torch.zeros((8, self.H, self.W)).to(device)
+        lidar_out = torch.zeros((12, self.H, self.W)).to(device)
         lidar_out[0] = range_img[0] * torch.cos(self.uv[0]) * torch.cos(self.uv[1])
         lidar_out[1] = range_img[0] * torch.cos(self.uv[0]) * torch.sin(self.uv[1]) * (-1)
         lidar_out[2] = range_img[0] * torch.sin(self.uv[0])
         lidar_out[3:] = range_img[1:]
-        lidar_out = lidar_out.permute((2, 1, 0)).reshape([-1, 8])
+        lidar_out = lidar_out.permute((2, 1, 0)).reshape([-1, 12])
         lidar_out = lidar_out[torch.where(lidar_out[:, 0] != 0)]
         return lidar_out
 
@@ -486,6 +489,86 @@ class Up(nn.Module):
         x = nn.Dropout2d(0.25)(x)
         return x
 
-class Transformer(nn.Module):
-    def __init__(self):
-        super(Transformer, self).__init__()
+class Attention(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(Attention, self).__init__()
+        self.q_conv = nn.Conv2d(in_channel, out_channel, kernel_size=1)
+        self.k_conv = nn.Conv2d(in_channel, out_channel, kernel_size=1)
+        self.v_conv = nn.Conv2d(in_channel, out_channel, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+        self.channel_back = nn.Sequential(
+            nn.Conv2d(out_channel, in_channel, kernel_size=1),
+            nn.BatchNorm2d(in_channel),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, range, img):
+        batch_size, C, width, height = range.size()
+        query_range = self.q_conv(range).view(batch_size, -1, width * height).permute(0, 2, 1)
+        key_img = self.k_conv(img).view(batch_size, -1, width * height)
+        correlation = torch.bmm(query_range, key_img)
+        attention = self.softmax(correlation)
+        value_img = self.v_conv(img).view(batch_size, -1, width * height)
+        out = torch.bmm(value_img, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C//2, width, height)
+        # out = self.gamma * out
+        out = self.channel_back(out)
+        out = img + out
+        return out
+
+class Fusion(nn.Module):
+    def __init__(self, range_in_channel, img_in_channel):
+        super(Fusion, self).__init__()
+        self.range_conv1 = nn.Sequential(
+            nn.Conv2d(range_in_channel, 16, kernel_size=3, padding=2, stride=1, dilation=2),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2,2))
+        )
+        self.img_conv1 = nn.Sequential(
+            nn.Conv2d(img_in_channel, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2,2))
+        )
+        self.attention1 = Attention(16, 8)
+
+        self.range_conv2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, padding=2, stride=1, dilation=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2,2))
+        )
+        self.img_conv2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2,2))
+        )
+        self.attention2 = Attention(32, 16)
+
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(in_channels=32, out_channels=16, kernel_size=(3, 3), stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(in_channels=16, out_channels=8, kernel_size=(3, 3), stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, range, img):
+        img = img[:, :, (img.shape[2]) // 3:, :]
+        img = F.interpolate(img, (48, 512))
+        x1 = self.range_conv1(range)    #16x24x256
+        y1 = self.img_conv1(img)        #16x24x256
+        y_att = self.attention1(x1, y1) #16x24x256
+        x2 = self.range_conv2(x1)       #32x12x128
+        y2 = self.img_conv2(y_att)      #32x12x128
+        y_att2 = self.attention2(x2, y2)#32x12x128
+
+        y_up1 = self.up1(y_att2)        #16x24x256
+        y_up2 = self.up2(y_up1 + y1)    #8x48x512
+        return y_up2
