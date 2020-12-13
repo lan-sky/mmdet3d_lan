@@ -115,12 +115,9 @@ class VoxelNet(SingleStage3DDetector):
         for i in range(batchsize):
             rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
         rangeImage = torch.cat(rangeImage, dim=0)
-        # 是否加入img信息
-        range_feat = self.fusion(rangeImage, img)
-        range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
         pts_with_range = []
         for i in range(batchsize):
-            pts_with_range.append(self.range_to_lidar_gpu(range_ori[i].squeeze(0)))
+            pts_with_range.append(self.range_to_lidar_gpu(rangeImage[i].squeeze(0)))
 
         x = self.extract_feat(pts_with_range, img_metas)
         outs = self.bbox_head(x)
@@ -138,13 +135,9 @@ class VoxelNet(SingleStage3DDetector):
         for i in range(batchsize):
             rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
         rangeImage = torch.cat(rangeImage, dim=0)
-        # 是否加入img信息
-        # range_feat = self.range_encoder(rangeImage, imgs)      #用自编码器的形式
-        range_feat = self.fusion(rangeImage, imgs)
-        range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
         pts_with_range = []
         for i in range(batchsize):
-            pts_with_range.append(self.range_to_lidar_gpu(range_ori[i].squeeze(0)))
+            pts_with_range.append(self.range_to_lidar_gpu(rangeImage[i].squeeze(0)))
 
         x = self.extract_feat(pts_with_range, img_metas)
         outs = self.bbox_head(x)
@@ -221,12 +214,12 @@ class VoxelNet(SingleStage3DDetector):
     def range_to_lidar_gpu(self, range_img):
         device = range_img.device
         self.uv = self.uv.to(device)
-        lidar_out = torch.zeros((12, self.H, self.W)).to(device)
+        lidar_out = torch.zeros((4, self.H, self.W)).to(device)
         lidar_out[0] = range_img[0] * torch.cos(self.uv[0]) * torch.cos(self.uv[1])
         lidar_out[1] = range_img[0] * torch.cos(self.uv[0]) * torch.sin(self.uv[1]) * (-1)
         lidar_out[2] = range_img[0] * torch.sin(self.uv[0])
-        lidar_out[3:] = range_img[1:]
-        lidar_out = lidar_out.permute((2, 1, 0)).reshape([-1, 12])
+        lidar_out[3] = range_img[1]
+        lidar_out = lidar_out.permute((2, 1, 0)).reshape([-1, 4])
         lidar_out = lidar_out[torch.where(lidar_out[:, 0] != 0)]
         return lidar_out
 
