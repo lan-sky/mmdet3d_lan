@@ -36,37 +36,18 @@ class VoxelNet(SingleStage3DDetector):
         self.voxel_layer = Voxelization(**voxel_layer)
         self.voxel_encoder = builder.build_voxel_encoder(voxel_encoder)
         self.middle_encoder = builder.build_middle_encoder(middle_encoder)
-        self.img_encoder = ImgFeatExtractor()
-        self.refmap_encoder = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(64),
-            nn.ReLU()
-        )
-        self.ref_to_cls = nn.Sequential(
-            nn.Conv2d(64, 18, kernel_size=1),
-            nn.BatchNorm2d(18),
-            nn.ReLU()
-        )
+
 
     def extract_feat(self, points, img_metas):
         """Extract features from points."""
         voxels, num_points, coors = self.voxelize(points)
-        #提取出反射率信息
-        voxel_features, reflection = self.voxel_encoder(voxels, num_points, coors)
+        voxel_features = self.voxel_encoder(voxels, num_points, coors)
         batch_size = coors[-1, 0].item() + 1
-
-        #对反射率地图做scatter
-        ref_map = self.middle_encoder(reflection, coors, batch_size)
-        ref_map = self.refmap_encoder(ref_map)
-
         x = self.middle_encoder(voxel_features, coors, batch_size)
         x = self.backbone(x)
         if self.with_neck:
             x = self.neck(x)
-        return x, ref_map
+        return x
 
     @torch.no_grad()
     @force_fp32()
@@ -109,21 +90,8 @@ class VoxelNet(SingleStage3DDetector):
         Returns:
             dict: Losses of each branch.
         """
-        x, ref_map = self.extract_feat(points, img_metas)
-        #img特征提取
-        img_feat = self.img_encoder(img)
-        img_feat = self.bbox_head([img_feat])
-
+        x = self.extract_feat(points, img_metas)
         outs = self.bbox_head(x)
-        #从反射率地图中求cls score
-        ref_cls_score = self.ref_to_cls(ref_map)
-
-        #用img求结果与point结果相加
-        for i in range(len(outs)):
-            outs[i][0] += img_feat[i][0]
-        #用反射率加权
-        outs[0][0] *= (ref_cls_score * 2 + 1)
-
         loss_inputs = outs + (gt_bboxes_3d, gt_labels_3d, img_metas)
         losses = self.bbox_head.loss(
             *loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
@@ -131,20 +99,8 @@ class VoxelNet(SingleStage3DDetector):
 
     def simple_test(self, points, img_metas, imgs=None, rescale=False):
         """Test function without augmentaiton."""
-        x, ref_map = self.extract_feat(points, img_metas)
-
-        img_feat = self.img_encoder(imgs)
-        img_feat = self.bbox_head([img_feat])
-
+        x = self.extract_feat(points, img_metas)
         outs = self.bbox_head(x)
-        #从反射率地图中求cls score
-        ref_cls_score = self.ref_to_cls(ref_map)
-
-        for i in range(len(outs)):
-            outs[i][0] += img_feat[i][0]
-        #用反射率加权
-        outs[0][0] *= (ref_cls_score * 2 + 1)
-
         bbox_list = self.bbox_head.get_bboxes(
             *outs, img_metas, rescale=rescale)
         bbox_results = [
@@ -174,48 +130,3 @@ class VoxelNet(SingleStage3DDetector):
                                             self.bbox_head.test_cfg)
 
         return [merged_bboxes]
-
-class ImgFeatExtractor(nn.Module):
-    def __init__(self):
-        super(ImgFeatExtractor, self).__init__()
-        self.extract_img_feat = torchvision.models.resnet50(pretrained=True).eval().cuda()
-        self.argpool = nn.AdaptiveAvgPool2d((496, 432))
-        self.Linear = nn.Sequential(
-            nn.Linear(512, 384),
-            nn.BatchNorm2d(384),
-            nn.ReLU()
-        )
-        self.deblocks = nn.ModuleList([
-            nn.Sequential(
-                nn.ConvTranspose2d(256, 128, kernel_size=(2, 2), stride=(2, 2), bias=False),
-                nn.BatchNorm2d(128, eps=0.001, momentum=0.01, affine=True, track_running_stats=True),
-                nn.ReLU(inplace=True)
-            ),
-            nn.Sequential(
-                nn.ConvTranspose2d(512, 128, kernel_size=(4, 4), stride=(4, 4), bias=False),
-                nn.BatchNorm2d(128, eps=0.001, momentum=0.01, affine=True, track_running_stats=True),
-                nn.ReLU(inplace=True)
-            ),
-            nn.Sequential(
-                nn.ConvTranspose2d(1024, 128, kernel_size=(8, 8), stride=(8, 8), bias=False),
-                nn.BatchNorm2d(128, eps=0.001, momentum=0.01, affine=True, track_running_stats=True),
-                nn.ReLU(inplace=True)
-            )
-        ])
-
-    def forward(self, img):
-        out = self.argpool(torch.transpose(img, 2, 3))
-        out = self.extract_img_feat.conv1(out)
-        out = self.extract_img_feat.bn1(out)
-        out = self.extract_img_feat.relu(out)
-        out = self.extract_img_feat.maxpool(out)
-
-        out1 = self.extract_img_feat.layer1(out)
-        out2 = self.extract_img_feat.layer2(out1)
-        out3 = self.extract_img_feat.layer3(out2)
-
-        out1 = self.deblocks[0](out1)
-        out2 = self.deblocks[1](out2)
-        out3 = self.deblocks[2](out3)
-        img_feat = torch.cat((out1, out2, out3), dim=1)
-        return img_feat
