@@ -485,7 +485,3 @@ class Up(nn.Module):
         x = self.conv(x)
         x = nn.Dropout2d(0.25)(x)
         return x
-
-class Transformer(nn.Module):
-    def __init__(self):
-        super(Transformer, self).__init__()
