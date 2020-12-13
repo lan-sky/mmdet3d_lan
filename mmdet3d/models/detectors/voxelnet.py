@@ -37,21 +37,6 @@ class VoxelNet(SingleStage3DDetector):
         self.voxel_layer = Voxelization(**voxel_layer)
         self.voxel_encoder = builder.build_voxel_encoder(voxel_encoder)
         self.middle_encoder = builder.build_middle_encoder(middle_encoder)
-        # 融合Img信息部分代码
-        # self.img_encoder = ImgFeatExtractor()
-        # self.refmap_encoder = nn.Sequential(
-        #     nn.Conv2d(1, 64, kernel_size=3, padding=1, stride=1),
-        #     nn.BatchNorm2d(64),
-        #     nn.ReLU(),
-        #     nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),
-        #     nn.BatchNorm2d(64),
-        #     nn.ReLU()
-        # )
-        # self.ref_to_cls = nn.Sequential(
-        #     nn.Conv2d(64, 18, kernel_size=1),
-        #     nn.BatchNorm2d(18),
-        #     nn.ReLU()
-        # )
 
         # 转换RangeImage部分相关代码
         self.H = 48
@@ -68,20 +53,14 @@ class VoxelNet(SingleStage3DDetector):
         self.uv[0] = ((self.H - self.uv[0]) * fov - abs(fov_down) * self.H) / self.H
         self.uv[1] = (self.uv[1] * 2.0 - self.W) * self.pi / (self.W * 4)  # 最后一个 4 用来控制水平范围
 
-        # self.range_encoder = RangeEncoder(5, 64, use_img=True)
         self.fusion = Fusion(5, 3)
 
     def extract_feat(self, points, img_metas):
         """Extract features from points."""
         voxels, num_points, coors = self.voxelize(points)
         #提取出反射率信息
-        voxel_features, reflection = self.voxel_encoder(voxels, num_points, coors)
+        voxel_features = self.voxel_encoder(voxels, num_points, coors)
         batch_size = coors[-1, 0].item() + 1
-
-        #对反射率地图做scatter
-        # ref_map = self.middle_encoder(reflection, coors, batch_size)
-        # ref_map = self.refmap_encoder(ref_map)
-
         x = self.middle_encoder(voxel_features, coors, batch_size)
         x = self.backbone(x)
         if self.with_neck:
@@ -137,7 +116,6 @@ class VoxelNet(SingleStage3DDetector):
             rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
         rangeImage = torch.cat(rangeImage, dim=0)
         # 是否加入img信息
-        # range_feat = self.range_encoder(rangeImage, img)      #用自编码器的形式
         range_feat = self.fusion(rangeImage, img)
         range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
         pts_with_range = []
@@ -145,20 +123,7 @@ class VoxelNet(SingleStage3DDetector):
             pts_with_range.append(self.range_to_lidar_gpu(range_ori[i].squeeze(0)))
 
         x = self.extract_feat(pts_with_range, img_metas)
-        #img特征提取
-        # img_feat = self.img_encoder(img)
-        # img_feat = self.bbox_head([img_feat])
-
         outs = self.bbox_head(x)
-        #从反射率地图中求cls score
-        # ref_cls_score = self.ref_to_cls(ref_map)
-
-        #用img求结果与point结果相加
-        # for i in range(len(outs)):
-        #     outs[i][0] += img_feat[i][0]
-        #用反射率加权
-        # outs[0][0] *= (ref_cls_score * 2 + 1)
-
         loss_inputs = outs + (gt_bboxes_3d, gt_labels_3d, img_metas)
         losses = self.bbox_head.loss(
             *loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
@@ -182,19 +147,7 @@ class VoxelNet(SingleStage3DDetector):
             pts_with_range.append(self.range_to_lidar_gpu(range_ori[i].squeeze(0)))
 
         x = self.extract_feat(pts_with_range, img_metas)
-
-        # img特征提取
-        # img_feat = self.img_encoder(imgs)
-        # img_feat = self.bbox_head([img_feat])
-
         outs = self.bbox_head(x)
-        #从反射率地图中求cls score
-        # ref_cls_score = self.ref_to_cls(ref_map)
-
-        # for i in range(len(outs)):
-        #     outs[i][0] += img_feat[i][0]
-        #用反射率加权
-        # outs[0][0] *= (ref_cls_score * 2 + 1)
 
         bbox_list = self.bbox_head.get_bboxes(
             *outs, img_metas, rescale=rescale)
@@ -276,218 +229,6 @@ class VoxelNet(SingleStage3DDetector):
         lidar_out = lidar_out.permute((2, 1, 0)).reshape([-1, 12])
         lidar_out = lidar_out[torch.where(lidar_out[:, 0] != 0)]
         return lidar_out
-
-class ImgFeatExtractor(nn.Module):
-    def __init__(self):
-        super(ImgFeatExtractor, self).__init__()
-        self.extract_img_feat = torchvision.models.resnet50(pretrained=True).eval().cuda()
-        self.argpool = nn.AdaptiveAvgPool2d((496, 432))
-        self.Linear = nn.Sequential(
-            nn.Linear(512, 384),
-            nn.BatchNorm2d(384),
-            nn.ReLU()
-        )
-        self.deblocks = nn.ModuleList([
-            nn.Sequential(
-                nn.ConvTranspose2d(256, 128, kernel_size=(2, 2), stride=(2, 2), bias=False),
-                nn.BatchNorm2d(128, eps=0.001, momentum=0.01, affine=True, track_running_stats=True),
-                nn.ReLU(inplace=True)
-            ),
-            nn.Sequential(
-                nn.ConvTranspose2d(512, 128, kernel_size=(4, 4), stride=(4, 4), bias=False),
-                nn.BatchNorm2d(128, eps=0.001, momentum=0.01, affine=True, track_running_stats=True),
-                nn.ReLU(inplace=True)
-            ),
-            nn.Sequential(
-                nn.ConvTranspose2d(1024, 128, kernel_size=(8, 8), stride=(8, 8), bias=False),
-                nn.BatchNorm2d(128, eps=0.001, momentum=0.01, affine=True, track_running_stats=True),
-                nn.ReLU(inplace=True)
-            )
-        ])
-
-    def forward(self, img):
-        out = self.argpool(torch.transpose(img, 2, 3))
-        out = self.extract_img_feat.conv1(out)
-        out = self.extract_img_feat.bn1(out)
-        out = self.extract_img_feat.relu(out)
-        out = self.extract_img_feat.maxpool(out)
-
-        out1 = self.extract_img_feat.layer1(out)
-        out2 = self.extract_img_feat.layer2(out1)
-        out3 = self.extract_img_feat.layer3(out2)
-
-        out1 = self.deblocks[0](out1)
-        out2 = self.deblocks[1](out2)
-        out3 = self.deblocks[2](out3)
-        img_feat = torch.cat((out1, out2, out3), dim=1)
-        return img_feat
-
-class RangeEncoder(nn.Module):
-    def __init__(self, in_channel, out_channel, use_img=False):
-        super(RangeEncoder, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channel, 32, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 256)
-        self.down4 = Down(256, 256)
-
-        self.up1 = Up(256, 256, 128)
-        self.up2 = Up(128, 256, 128)
-        self.up3 = Up(128, 128, 64)
-        self.up4 = Up(64, 64, out_channel)
-        if use_img:
-            self.img_conv = nn.Sequential(
-                nn.Conv2d(3, 32, kernel_size=3, padding=1, stride=1),
-                nn.BatchNorm2d(32),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=1),
-                nn.BatchNorm2d(64),
-                nn.ReLU(inplace=True)
-            )
-            self.img_down1 = Down(64, 128)
-            self.img_down2 = Down(128, 256)
-            self.img_down3 = Down(256, 256)
-            self.img_down4 = Down(256, 256)
-            self.img_lidar_conv1 = nn.Sequential(
-                nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, padding=1, stride=1),
-                nn.BatchNorm2d(128),
-                nn.ReLU(inplace=True)
-            )
-            self.img_lidar_conv2 = nn.Sequential(
-                nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, padding=1, stride=1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True)
-            )
-            self.img_lidar_conv3 = nn.Sequential(
-                nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, padding=1, stride=1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True)
-            )
-            self.img_lidar_conv4 = nn.Sequential(
-                nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3, padding=1, stride=1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True)
-            )
-        self.down_sample = nn.Sequential(
-            nn.Conv2d(in_channels=64, out_channels=4, kernel_size=1, padding=0, stride=1),
-            nn.BatchNorm2d(4),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x, img=None):
-        x = self.conv(x)
-
-        if img is not None:
-            img = img[:, :, (img.shape[2]) // 3:, :]
-            img = F.interpolate(img, (48, 512))
-            img = self.img_conv(img)
-
-            img1 = self.img_down1(img)
-            x_d1 = self.down1(x)
-            x_d1 = torch.cat((x_d1, img1), dim=1)
-            x_d1 = self.img_lidar_conv1(x_d1)
-
-            img2 = self.img_down2(img1)
-            x_d2 = self.down2(x_d1)
-            x_d2 = torch.cat((x_d2, img2), dim=1)
-            x_d2 = self.img_lidar_conv2(x_d2)
-
-            img3 = self.img_down3(img2)
-            x_d3 = self.down3(x_d2)
-            x_d3 = torch.cat((x_d3, img3), dim=1)
-            x_d3 = self.img_lidar_conv3(x_d3)
-
-            img4 = self.img_down4(img3)
-            x_d4 = self.down4(x_d3)
-            x_d4 = torch.cat((x_d4, img4), dim=1)
-            x_d4 = self.img_lidar_conv4(x_d4)
-
-        else:
-            x_d1 = self.down1(x)
-            x_d2 = self.down2(x_d1)
-            x_d3 = self.down3(x_d2)
-            x_d4 = self.down4(x_d3)
-
-        x_u1 = self.up1(x_d4, x_d3)
-        x_u2 = self.up2(x_u1, x_d2)
-        x_u3 = self.up3(x_u2, x_d1)
-        x_u4 = self.up4(x_u3, x)
-
-        x_out = self.down_sample(x_u4)
-        return x_out
-
-
-class Down(nn.Module):
-    def __init__(self, in_channel, out_channel):
-        super(Down, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=(3, 3), padding=1, stride=1),
-            nn.BatchNorm2d(in_channel),
-            nn.ReLU(inplace=True)
-        )
-        self.dilatedconv1 = nn.Sequential(
-            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=(3, 3), padding=2, stride=1, dilation=2),
-            nn.BatchNorm2d(in_channel),
-            nn.ReLU(inplace=True)
-        )
-        self.dilatedconv2 = nn.Sequential(
-            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=(3, 3), padding=2, stride=1, dilation=2),
-            nn.BatchNorm2d(in_channel),
-            nn.ReLU(inplace=True)
-        )
-        self.dilatedconv3 = nn.Sequential(
-            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=(3, 3), padding=2, stride=1, dilation=2),
-            nn.BatchNorm2d(in_channel),
-            nn.ReLU(inplace=True)
-        )
-        self.down = nn.Sequential(
-            nn.Conv2d(in_channels=in_channel * 3, out_channels=out_channel, kernel_size=(3, 3), padding=1, stride=1),
-            nn.BatchNorm2d(out_channel),
-            nn.ReLU(),
-            nn.Dropout2d(0.25),
-            nn.MaxPool2d((2, 2))
-        )
-
-    def forward(self, x):
-        x = self.conv(x)
-        x1 = self.dilatedconv1(x)
-        x2 = self.dilatedconv2(x1)
-        x3 = self.dilatedconv3(x2)
-        x_all = torch.cat((x1, x2, x3), dim=1)
-        x_out = self.down(x_all)
-        return x_out
-
-class Up(nn.Module):
-    def __init__(self, in_channel, res_channel, out_channel):
-        super(Up, self).__init__()
-        self.up = nn.Sequential(
-            nn.ConvTranspose2d(in_channels=in_channel, out_channels=out_channel, kernel_size=(3, 3), stride=2, padding=1, output_padding=1),
-            nn.BatchNorm2d(out_channel),
-            nn.ReLU(inplace=True)
-        )
-        mid_channels = (out_channel + res_channel) // 2
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels=(out_channel + res_channel), out_channels=mid_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=mid_channels, out_channels=out_channel, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channel),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x1, x2):
-        x1 = self.up(x1)
-        x = torch.cat((x1, x2), dim=1)
-        x = self.conv(x)
-        x = nn.Dropout2d(0.25)(x)
-        return x
 
 class Attention(nn.Module):
     def __init__(self, in_channel, out_channel):

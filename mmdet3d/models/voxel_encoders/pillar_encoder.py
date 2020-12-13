@@ -90,13 +90,11 @@ class PillarFeatureNet(nn.Module):
     @force_fp32(out_fp16=True)
     def forward(self, features, num_points, coors):
         """Forward function.
-
         Args:
             features (torch.Tensor): Point features or raw points in shape
                 (N, M, C).
             num_points (torch.Tensor): Number of points in each pillar.
             coors (torch.Tensor): Coordinates of each voxel.
-
         Returns:
             torch.Tensor: Features of pillars.
         """
@@ -105,7 +103,7 @@ class PillarFeatureNet(nn.Module):
         if self._with_cluster_center:
             points_mean = features[:, :, :3].sum(
                 dim=1, keepdim=True) / num_points.type_as(features).view(
-                    -1, 1, 1)
+                -1, 1, 1)
             f_cluster = features[:, :, :3] - points_mean
             features_ls.append(f_cluster)
 
@@ -115,19 +113,19 @@ class PillarFeatureNet(nn.Module):
             if not self.legacy:
                 f_center = torch.zeros_like(features[:, :, :2])
                 f_center[:, :, 0] = features[:, :, 0] - (
-                    coors[:, 3].to(dtype).unsqueeze(1) * self.vx +
-                    self.x_offset)
+                        coors[:, 3].to(dtype).unsqueeze(1) * self.vx +
+                        self.x_offset)
                 f_center[:, :, 1] = features[:, :, 1] - (
-                    coors[:, 2].to(dtype).unsqueeze(1) * self.vy +
-                    self.y_offset)
+                        coors[:, 2].to(dtype).unsqueeze(1) * self.vy +
+                        self.y_offset)
             else:
                 f_center = features[:, :, :2]
                 f_center[:, :, 0] = f_center[:, :, 0] - (
-                    coors[:, 3].type_as(features).unsqueeze(1) * self.vx +
-                    self.x_offset)
+                        coors[:, 3].type_as(features).unsqueeze(1) * self.vx +
+                        self.x_offset)
                 f_center[:, :, 1] = f_center[:, :, 1] - (
-                    coors[:, 2].type_as(features).unsqueeze(1) * self.vy +
-                    self.y_offset)
+                        coors[:, 2].type_as(features).unsqueeze(1) * self.vy +
+                        self.y_offset)
             features_ls.append(f_center)
 
         if self._with_distance:
@@ -144,14 +142,10 @@ class PillarFeatureNet(nn.Module):
         mask = torch.unsqueeze(mask, -1).type_as(features)
         features *= mask
 
-        #获得反射率
-        reflection = features[:, :, 3].clone()
-        reflection_max = torch.max(reflection, dim=1, keepdim=True)[0]
-
         for pfn in self.pfn_layers:
             features = pfn(features, num_points)
 
-        return features.squeeze(), reflection_max
+        return features.squeeze()
 
 
 @VOXEL_ENCODERS.register_module()
