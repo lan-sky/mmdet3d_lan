@@ -5,6 +5,8 @@ from mmdet3d.ops import Voxelization
 from mmdet.models import DETECTORS
 from .. import builder
 from .two_stage import TwoStage3DDetector
+from .voxelnet import Fusion
+import numpy as np
 
 
 @DETECTORS.register_module()
@@ -37,6 +39,24 @@ class PartA2(TwoStage3DDetector):
         self.voxel_layer = Voxelization(**voxel_layer)
         self.voxel_encoder = builder.build_voxel_encoder(voxel_encoder)
         self.middle_encoder = builder.build_middle_encoder(middle_encoder)
+
+        # 转换RangeImage部分相关代码
+        self.H = 48
+        self.W = 512
+        self.fov_up = 3
+        self.fov_down = -15.0
+        self.pi = torch.tensor(np.pi)
+        fov_up = self.fov_up * self.pi / 180.0
+        fov_down = self.fov_down * self.pi / 180.0
+        fov = abs(fov_up) + abs(fov_down)
+        self.uv = torch.zeros((2, self.H, self.W))
+        self.uv[1] = torch.arange(0, self.W)
+        self.uv.permute((0, 2, 1))[0] = torch.arange(0, self.H)
+        self.uv[0] = ((self.H - self.uv[0]) * fov - abs(fov_down) * self.H) / self.H
+        self.uv[1] = (self.uv[1] * 2.0 - self.W) * self.pi / (self.W * 4)  # 最后一个 4 用来控制水平范围
+
+        # self.range_encoder = RangeEncoder(5, 64, use_img=True)
+        self.fusion = Fusion(5, 3)
 
     def extract_feat(self, points, img_metas):
         """Extract features from points."""
@@ -89,6 +109,7 @@ class PartA2(TwoStage3DDetector):
                       img_metas,
                       gt_bboxes_3d,
                       gt_labels_3d,
+                      img=None,
                       gt_bboxes_ignore=None,
                       proposals=None):
         """Training forward function.
@@ -106,7 +127,22 @@ class PartA2(TwoStage3DDetector):
         Returns:
             dict: Losses of each branch.
         """
-        feats_dict, voxels_dict = self.extract_feat(points, img_metas)
+
+        # 转换成range提取特征后转回lidar
+        batchsize = len(points)
+        rangeImage = []
+        for i in range(batchsize):
+            rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
+        rangeImage = torch.cat(rangeImage, dim=0)
+        # 是否加入img信息
+        # range_feat = self.range_encoder(rangeImage, img)      #用自编码器的形式
+        range_feat = self.fusion(rangeImage, img)
+        range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
+        pts_with_range = []
+        for i in range(batchsize):
+            pts_with_range.append(self.range_to_lidar_gpu(range_ori[i].squeeze(0)))
+
+        feats_dict, voxels_dict = self.extract_feat(pts_with_range, img_metas)      #point 换成pts_with_range
 
         losses = dict()
 
@@ -133,9 +169,24 @@ class PartA2(TwoStage3DDetector):
 
         return losses
 
-    def simple_test(self, points, img_metas, proposals=None, rescale=False):
+    def simple_test(self, points, img_metas, imgs=None, proposals=None, rescale=False):
         """Test function without augmentaiton."""
-        feats_dict, voxels_dict = self.extract_feat(points, img_metas)
+
+        # 转换成range提取特征后转回lidar
+        batchsize = len(points)
+        rangeImage = []
+        for i in range(batchsize):
+            rangeImage.append(self.lidar_to_range_gpu(points[i]).unsqueeze(0))
+        rangeImage = torch.cat(rangeImage, dim=0)
+        # 是否加入img信息
+        # range_feat = self.range_encoder(rangeImage, img)      #用自编码器的形式
+        range_feat = self.fusion(rangeImage, imgs)
+        range_ori = torch.cat((rangeImage[:, 0:2], range_feat), dim=1)
+        pts_with_range = []
+        for i in range(batchsize):
+            pts_with_range.append(self.range_to_lidar_gpu(range_ori[i].squeeze(0)))
+
+        feats_dict, voxels_dict = self.extract_feat(pts_with_range, img_metas)
 
         if self.with_rpn:
             rpn_outs = self.rpn_head(feats_dict['neck_feats'])
@@ -147,3 +198,54 @@ class PartA2(TwoStage3DDetector):
 
         return self.roi_head.simple_test(feats_dict, voxels_dict, img_metas,
                                          proposal_list)
+
+    def lidar_to_range_gpu(self, points):
+        device = points.device
+        pi = torch.tensor(np.pi).to(device)
+        fov_up = self.fov_up * pi / 180.0
+        fov_down = self.fov_down * pi / 180.0
+        fov = abs(fov_up) + abs(fov_down)
+
+        depth = torch.norm(points, 2, dim=1)
+
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+
+        yaw = torch.atan2(y, x)
+        pitch = torch.asin(z / depth)
+
+        u = 0.5 * (1 - 4 * yaw / pi) * self.W  # 最后一个 4 用来控制水平范围
+        v = (1 - (pitch + abs(fov_down)) / fov) * self.H
+
+        zero_tensor = torch.zeros_like(u)
+        W_tensor = torch.ones_like(u) * (self.W - 1)
+        H_tensor = torch.ones_like(v) * (self.H - 1)
+
+        u = torch.floor(u)
+        u = torch.min(u, W_tensor)
+        u = torch.max(u, zero_tensor).long()
+
+        v = torch.floor(v)
+        v = torch.min(v, H_tensor)
+        v = torch.max(v, zero_tensor).long()
+
+        range_image = torch.full((5, self.H, self.W), 0, dtype=torch.float32).to(device)
+        range_image[0][v, u] = depth
+        range_image[1][v, u] = points[:, 3]
+        range_image[2][v, u] = points[:, 0]
+        range_image[3][v, u] = points[:, 1]
+        range_image[4][v, u] = points[:, 2]
+        return range_image
+
+    def range_to_lidar_gpu(self, range_img):
+        device = range_img.device
+        self.uv = self.uv.to(device)
+        lidar_out = torch.zeros((12, self.H, self.W)).to(device)
+        lidar_out[0] = range_img[0] * torch.cos(self.uv[0]) * torch.cos(self.uv[1])
+        lidar_out[1] = range_img[0] * torch.cos(self.uv[0]) * torch.sin(self.uv[1]) * (-1)
+        lidar_out[2] = range_img[0] * torch.sin(self.uv[0])
+        lidar_out[3:] = range_img[1:]
+        lidar_out = lidar_out.permute((2, 1, 0)).reshape([-1, 12])
+        lidar_out = lidar_out[torch.where(lidar_out[:, 0] != 0)]
+        return lidar_out
