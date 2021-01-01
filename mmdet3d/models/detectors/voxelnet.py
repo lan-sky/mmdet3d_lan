@@ -271,7 +271,11 @@ class Fusion(nn.Module):
             nn.Conv2d(img_in_channel, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d((2,2))
+            nn.MaxPool2d((2,2)),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((24, 256))
         )
         self.attention1 = Attention(16, 8)
 
@@ -302,7 +306,7 @@ class Fusion(nn.Module):
 
     def forward(self, range, img):
         img = img[:, :, (img.shape[2]) // 3:, :]
-        img = F.interpolate(img, (48, 512))
+        # img = F.interpolate(img, (48, 512))
         x1 = self.range_conv1(range)    #16x24x256
         y1 = self.img_conv1(img)        #16x24x256
         y_att = self.attention1(x1, y1) #16x24x256
