@@ -79,7 +79,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=16,
+    samples_per_gpu=6,
     workers_per_gpu=4,
     train=dict(
         type='RepeatDataset',

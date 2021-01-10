@@ -39,8 +39,8 @@ class VoxelNet(SingleStage3DDetector):
         self.middle_encoder = builder.build_middle_encoder(middle_encoder)
 
         # 转换RangeImage部分相关代码
-        self.H = 48
-        self.W = 512
+        self.H = 64
+        self.W = 768
         self.fov_up = 3
         self.fov_down = -15.0
         self.pi = torch.tensor(np.pi)
@@ -236,6 +236,7 @@ class Attention(nn.Module):
         self.q_conv = nn.Conv2d(in_channel, out_channel, kernel_size=1)
         self.k_conv = nn.Conv2d(in_channel, out_channel, kernel_size=1)
         self.v_conv = nn.Conv2d(in_channel, out_channel, kernel_size=1)
+        self.range_v = nn.Conv2d(in_channel, out_channel, kernel_size=1)
         self.gamma = nn.Parameter(torch.zeros(1))
         self.softmax = nn.Softmax(dim=-1)
         self.channel_back = nn.Sequential(
@@ -250,11 +251,16 @@ class Attention(nn.Module):
         key_img = self.k_conv(img).view(batch_size, -1, width * height)
         correlation = torch.bmm(query_range, key_img)
         attention = self.softmax(correlation)
+
         value_img = self.v_conv(img).view(batch_size, -1, width * height)
+        value_range = self.range_v(range).view(batch_size, -1, width * height)
+
         out = torch.bmm(value_img, attention.permute(0, 2, 1))
+        out_range = torch.bmm(value_range, attention.permute(0, 2, 1))
         out = out.view(batch_size, C//2, width, height)
+        out_range = out_range.view(batch_size, C//2, width, height)
         # out = self.gamma * out
-        out = self.channel_back(out)
+        out = self.channel_back(out + out_range)
         out = img + out
         return out
 
@@ -275,7 +281,7 @@ class Fusion(nn.Module):
             nn.Conv2d(16, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((24, 256))
+            nn.AdaptiveAvgPool2d((32, 384))
         )
         self.attention1 = Attention(16, 8)
 
