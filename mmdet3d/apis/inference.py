@@ -84,6 +84,48 @@ def inference_detector(model, pcd):
         result = model(return_loss=False, rescale=True, **data)
     return result, data
 
+def inference_detector_with_img(model, pcd, img):
+    """Inference point cloud with the detector.
+
+    Args:
+        model (nn.Module): The loaded detector.
+        pcd (str): Point cloud files.
+
+    Returns:
+        tuple: Predicted results and data from pipeline.
+    """
+    cfg = model.cfg
+    device = next(model.parameters()).device  # model device
+    # build the data pipeline
+    test_pipeline = deepcopy(cfg.data.test.pipeline)
+    test_pipeline = Compose(test_pipeline)
+    box_type_3d, box_mode_3d = get_box_type(cfg.data.test.box_type_3d)
+    data = dict(
+        pts_filename=pcd,
+        img_prefix=None,
+        img_info=dict(filename=img),
+        box_type_3d=box_type_3d,
+        box_mode_3d=box_mode_3d,
+        img_fields=[],
+        bbox3d_fields=[],
+        pts_mask_fields=[],
+        pts_seg_fields=[],
+        bbox_fields=[],
+        mask_fields=[],
+        seg_fields=[])
+    data = test_pipeline(data)
+    data = collate([data], samples_per_gpu=1)
+    if next(model.parameters()).is_cuda:
+        # scatter to specified GPU
+        data = scatter(data, [device.index])[0]
+    else:
+        # this is a workaround to avoid the bug of MMDataParallel
+        data['img_metas'] = data['img_metas'][0].data
+        data['points'] = data['points'][0].data
+    # forward the model
+    with torch.no_grad():
+        result = model(return_loss=False, rescale=True, **data)
+    return result, data
 
 def show_result_meshlab(data, result, out_dir):
     """Show result by meshlab.
