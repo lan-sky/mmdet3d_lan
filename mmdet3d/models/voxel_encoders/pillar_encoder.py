@@ -42,6 +42,7 @@ class PillarFeatureNet(nn.Module):
                  with_distance=False,
                  with_cluster_center=True,
                  with_voxel_center=True,
+                 use_attention=True,
                  voxel_size=(0.2, 0.2, 4),
                  point_cloud_range=(0, -40, -3, 70.4, 40, 1),
                  norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
@@ -77,7 +78,8 @@ class PillarFeatureNet(nn.Module):
                     out_filters,
                     norm_cfg=norm_cfg,
                     last_layer=last_layer,
-                    mode=mode))
+                    mode=mode,
+                    use_attention=use_attention))
         self.pfn_layers = nn.ModuleList(pfn_layers)
 
         # Need pillar (voxel) size and x/y offset in order to calculate offset

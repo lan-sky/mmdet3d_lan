@@ -5,7 +5,6 @@ from mmdet3d.ops import Voxelization
 from mmdet.models import DETECTORS
 from .. import builder
 from .two_stage import TwoStage3DDetector
-from .voxelnet import Fusion
 import numpy as np
 
 

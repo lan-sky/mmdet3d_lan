@@ -124,6 +124,7 @@ class PFNLayer(nn.Module):
                  out_channels,
                  norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
                  last_layer=False,
+                 use_attention=False,
                  mode='max'):
 
         super().__init__()
@@ -136,6 +137,12 @@ class PFNLayer(nn.Module):
 
         self.norm = build_norm_layer(norm_cfg, self.units)[1]
         self.linear = nn.Linear(in_channels, self.units, bias=False)
+        self.use_attention = use_attention
+        if self.use_attention:
+            self.q_proj = nn.Linear(out_channels, out_channels, bias=True)
+            self.k_proj = nn.Linear(out_channels, out_channels, bias=True)
+            self.v_proj = nn.Linear(out_channels, out_channels, bias=True)
+            self.softmax = nn.Softmax(dim=-1)
 
         assert mode in ['max', 'avg']
         self.mode = mode
@@ -159,6 +166,14 @@ class PFNLayer(nn.Module):
         x = self.linear(inputs)
         x = self.norm(x.permute(0, 2, 1).contiguous()).permute(0, 2,
                                                                1).contiguous()
+        if self.use_attention:
+            q = self.q_proj(x)
+            k = self.k_proj(x).permute(0, 2, 1)
+            v = self.v_proj(x)
+            correlation = torch.bmm(q, k)
+            attention = self.softmax(correlation)
+            x = torch.bmm(v, attention)
+
         x = F.relu(x)
 
         if self.mode == 'max':
